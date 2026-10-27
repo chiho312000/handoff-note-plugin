@@ -310,10 +310,16 @@ def on_pre_tool_call(**kw):
 
 
 def _is_note(path, note: Path) -> bool:
+    # The current note or an older note of the same session: after another compression the bot
+    # often still names the note it was told about before (that write would hit Hermes' stale guard).
+    def session_of(p: Path) -> str:
+        return re.sub(r"-c\d+\.md$", "", p.name).split("-", 1)[-1]
     try:
-        return bool(path) and Path(path).resolve() == note.resolve()
-    except (OSError, ValueError):
+        p = Path(path).resolve()
+    except (OSError, ValueError, TypeError):
         return False
+    return (p.suffix == ".md" and p.parent.parent == note.resolve().parent.parent
+            and session_of(p) == session_of(note))
 
 
 def _append_handoff(session_id: str, note: Path, content) -> dict:
