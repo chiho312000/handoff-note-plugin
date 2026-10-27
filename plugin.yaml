@@ -1,5 +1,5 @@
 name: handoff-notes
-version: 0.7.2
+version: 0.7.3
 description: >
   Archives the handoff summary Hermes writes each time it compresses a
   conversation, as a Markdown note under this profile's handoffs/<date>/ folder.
