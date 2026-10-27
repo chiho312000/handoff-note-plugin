@@ -8,9 +8,10 @@ messages_removed / tokens_before / tokens_after; a note whose compression was ab
 keeps those blank.
 
 Every compression still saves a note, but only from the HANDOFF_AFTER-th
-(2nd) compaction on does the "Long tasks and handoff" rule in the project's
-agents.md apply: finish the current atomic step, append the agents.md template to
-the end of that note, tell the user to /new, stop. transform_tool_result appends that
+(2nd) compaction on is the agent told to hand off: finish the current atomic step, append a
+handoff (the "### Handoff template" of agents.md in the session's cwd, else handoff_template.md) to
+the end of that note, tell the user, stop. Once a note holds a handoff it stays the session's
+note even if a later compression saves another. transform_tool_result appends that
 instruction to tool results (pre_llm_call does it on a new user turn); pre_tool_call
 allows GRACE_TOOL_CALLS more calls for the atomic step plus any call touching the
 handoffs folder, then blocks the rest. Once the note has a "# Handoff" heading, every
@@ -20,8 +21,9 @@ Auto-handoff (gateway only): pre_gateway_dispatch remembers the runner and each 
 source. When the turn that wrote the handoff ends (post_llm_call), the chat is reset
 through the gateway's own /new path once it is idle, and the new session is told to read
 that note and continue. Under Hermes' session authority a plugin may only continue a chat,
-not open one, so when that injection is refused the user is asked to send any message and
-that first turn of the new session gets the continue instruction (pre_llm_call). Until the
+not open one, so there the user is asked to send any message and that first turn of the new
+session gets the continue instruction (pre_llm_call). A Local route (desktop/TUI chat) is
+exempt from that rule, so it is injected and also keeps that fallback. Until the
 first inbound message after a gateway start (runner not armed), or with /autohandoff off for
 that chat, the user is told to /new instead.
 
@@ -52,14 +54,15 @@ _finished: dict[str, Path] = {}
 # session id -> tool calls used since compaction (not counting handoff-note ones)
 _grace_used: dict[str, int] = {}
 
-# The project's handoff rule and template (project = config.yaml terminal.cwd).
-AGENTS_MD = Path(r"C:\Users\chiho\ggen\agents.md")
 GRACE_TOOL_CALLS = 6
 HANDOFF_AFTER = 2  # ponytail: compaction 1 saves a note only; handoff stops from compaction 2 on
 USER_MESSAGE = "Context compacted — handoff written. Start /new and say: continue from {note}"
 AUTO_MESSAGE = "Context compacted — handoff written to {note}. Moving to a new session."
 RESUME_MESSAGE = ("New session started from handoff {note}. Hermes does not let plugins open a session "
                   "on their own, so send any message (e.g. \"go\") and I will continue from it.")
+LOCAL_MESSAGE = ("New session started from handoff {note}; continuing automatically. If nothing happens, "
+                 "send any message (e.g. \"go\") and I will continue from it.")
+DEFAULT_TEMPLATE = Path(__file__).with_name("handoff_template.md")  # generic template, editable
 _CONTINUE = (
     "[handoff-notes] The previous session of this chat handed off to this one. Read the whole "
     "handoff note {note} (it is this chat's latest handoff) and continue the task from its next "
@@ -69,8 +72,7 @@ _HANDOFF_HEADING = re.compile(r"(?m)^# Handoff\b")
 
 _WRITE_HANDOFF = (
     "[handoff-notes] This conversation now contains two or more context-compaction "
-    "summaries, so the "
-    "'Long tasks and handoff' rule in agents.md applies. Finish the current atomic step "
+    "summaries, so it is time to hand off to a fresh session. Finish the current atomic step "
     "(never stop mid-edit or mid-run; at most {grace} more tool calls), then call write_file "
     "with path {note} and content = ONLY your handoff, starting with the '# Handoff' heading. "
     "The plugin appends it to the end of that note and keeps the summary already in it, so "
@@ -111,13 +113,18 @@ _DONE = (
 
 
 def _template() -> str:
-    # The "### Handoff template" block of agents.md, up to the next top-level heading.
+    # The "### Handoff template" block of the session project's agents.md, up to the next
+    # top-level heading; projects without one get the generic template in the plugin folder.
     try:
-        text = AGENTS_MD.read_text(encoding="utf-8")
+        text = (Path(_ctx.session_cwd()) / "agents.md").read_text(encoding="utf-8")
         block = re.split(r"(?m)^### Handoff template[ \t]*$", text, 1)[1]
         return re.split(r"(?m)^# (?!Handoff)", block, 1)[0].strip()
     except Exception:
-        return f"(see the Handoff template in {AGENTS_MD})"
+        pass
+    try:
+        return DEFAULT_TEMPLATE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "# Handoff — <date/time>\n(goal, done & verified, current state, failed attempts, next step)"
 
 
 def _handoff_written(note: Path) -> bool:
@@ -152,7 +159,8 @@ def _handoff_note(session_id: str | None) -> Path | None:
         notes = sorted(HANDOFF_DIR.glob(f"*/*-{session}-c*.md"))
         if len(notes) < HANDOFF_AFTER:
             return None
-        _finished[session] = notes[-1]
+        # A note that already holds the handoff wins over any later compression's note.
+        _finished[session] = next((n for n in reversed(notes) if _handoff_written(n)), notes[-1])
     return _finished[session]
 
 
@@ -189,6 +197,7 @@ def on_post_auxiliary_call(**kw) -> None:
         usage = kw.get("usage") or {}
         now = datetime.now()
         with _lock:
+            prev = _handoff_note(kw.get("session_id"))  # before this note exists on disk
             day_dir = HANDOFF_DIR / now.strftime("%Y-%m-%d")
             day_dir.mkdir(parents=True, exist_ok=True)
             n = _next_index(session)
@@ -210,7 +219,8 @@ def on_post_auxiliary_call(**kw) -> None:
             ])
             path.write_text(header + summary + "\n", encoding="utf-8")
             _pending[session] = path
-            if n >= HANDOFF_AFTER:
+            # A compression after the handoff was written must not replace the note that holds it.
+            if n >= HANDOFF_AFTER and not (prev and _handoff_written(prev)):
                 _finished[session] = path
         logger.info("handoff-notes: saved %s", path)
     except Exception:
@@ -241,7 +251,9 @@ def on_post_compaction(**kw) -> None:
                 # already reached HANDOFF_AFTER compressions.
                 old = _safe(kw["old_session_id"])
                 if len(list(HANDOFF_DIR.glob(f"*/*-{old}-c*.md"))) >= HANDOFF_AFTER:
-                    _finished[_safe(kw["session_id"])] = path
+                    old_note = _finished.get(old)
+                    _finished[_safe(kw["session_id"])] = (
+                        old_note if old_note and _handoff_written(old_note) else path)
             head, sep, body = path.read_text(encoding="utf-8").partition("\n---\n")
             for name, value in values.items():
                 head = re.sub(rf"(?m)^{name}: *$", f"{name}: {'' if value is None else value}", head)
@@ -384,9 +396,15 @@ async def _rotate(key: str, old_session_id: str, note: Path) -> None:
         if new is not None:
             _resume[new.session_id] = note
         source = _sources[key]
-        await _runner._delivery_adapter_for(source).send(source.chat_id, RESUME_MESSAGE.format(note=note.name))
-        logger.info("handoff-notes: %s reset from %s; waiting for a message to resume via %s",
-                    key, old_session_id, note)
+        # A Local route injects through its live source, which that rule does not apply to; the
+        # fallback stays armed in case the injection is refused later (a duplicate is harmless).
+        local = str(getattr(getattr(source, "platform", None), "value", "")) == "local"
+        message = RESUME_MESSAGE
+        if local and _ctx.inject_message(_CONTINUE.format(note=note), session_key=key):
+            message = LOCAL_MESSAGE
+        await _runner._delivery_adapter_for(source).send(source.chat_id, message.format(note=note.name))
+        logger.info("handoff-notes: %s reset from %s (%s); resume via %s",
+                    key, old_session_id, "injected" if message is LOCAL_MESSAGE else "awaiting a message", note)
     except Exception:
         logger.warning("handoff-notes: auto-handoff failed for %s", key, exc_info=True)
 
