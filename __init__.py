@@ -8,7 +8,8 @@ messages_removed / tokens_before / tokens_after; a note whose compression was ab
 keeps those blank.
 
 Every compression still saves a note, but only from the HANDOFF_AFTER-th
-(2nd) compaction on is the agent told to hand off: finish the current atomic step, append a
+(2nd) compaction since the last in-place continue is the agent told to hand off: finish the
+current atomic step, append a
 handoff (the "### Handoff template" of agents.md in the session's cwd, else handoff_template.md) to
 the end of that note, tell the user, stop. Once a note holds a handoff it stays the session's
 note even if a later compression saves another. transform_tool_result appends that
@@ -20,16 +21,16 @@ tool is blocked. Failures are logged, never raised (and never block).
 Auto-handoff (gateway): the runner is the one pre_gateway_dispatch saw, else the host the gateway
 publishes to plugin managers (Local desktop/TUI turns never fire pre_gateway_dispatch); a chat's
 source is the latest inbound one, else its session entry's restored origin. When the turn that
-wrote the handoff ends (post_llm_call), the chat is reset
-through the gateway's own /new path once it is idle, and the new session is told to read
-that note and continue. Under Hermes' session authority a plugin may only continue a chat,
-not open one, so there the user is asked to send any message and that first turn of the new
-session gets the continue instruction (pre_llm_call). A Local route (desktop/TUI chat) is
-exempt from that rule, so it is injected and also keeps that fallback. With no gateway in the
-process, or with /autohandoff off for that chat, the user is told to /new instead.
-
-Auto-handoff (classic CLI REPL): the same turn-end queues "/new" and then the continue
-instruction on the REPL's input queue, so the REPL starts a new session and continues in it.
+wrote the handoff ends (post_llm_call), once the chat is idle, the chat continues in the same
+session: the note is marked continued, which restarts the compression count and lifts the tool
+block; the gateway's own "/compress here 1" then summarizes all but the last turn (the nearest
+thing to /clear that keeps the session), and the continue instruction is injected. That covers Local routes (the classic
+CLI, TUI and desktop app are gateway viewers of one session and never follow a gateway-side
+reset) and every chat under a session authority (a plugin may continue a chat but not open the
+fresh session a reset makes). Only a gateway without a session authority resets messaging chats
+through its own /new path and tells the new session to continue; if that injection fails, the
+user is asked to send any message and that first turn gets the instruction (pre_llm_call).
+With no gateway in the process, or with /autohandoff off for that chat, the user is told to /new.
 """
 from __future__ import annotations
 
@@ -59,21 +60,27 @@ GRACE_TOOL_CALLS = 6
 HANDOFF_AFTER = 2  # ponytail: compaction 1 saves a note only; handoff stops from compaction 2 on
 USER_MESSAGE = "Context compacted — handoff written. Start /new and say: continue from {note}"
 AUTO_MESSAGE = "Context compacted — handoff written to {note}. Moving to a new session."
+IN_PLACE_MESSAGE = ("Context compacted — handoff written to {note}. Clearing the context and continuing "
+                    "from it in this session.")
 RESUME_MESSAGE = ("New session started from handoff {note}. Hermes does not let plugins open a session "
                   "on their own, so send any message (e.g. \"go\") and I will continue from it.")
-LOCAL_MESSAGE = ("New session started from handoff {note}; continuing automatically. If nothing happens, "
-                 "send any message (e.g. \"go\") and I will continue from it.")
 DEFAULT_TEMPLATE = Path(__file__).with_name("handoff_template.md")  # generic template, editable
 _CONTINUE = (
     "[handoff-notes] The previous session of this chat handed off to this one. Read the whole "
     "handoff note {note} (it is this chat's latest handoff) and continue the task from its next "
     "action without waiting for user input."
 )
+_CONTINUE_IN_PLACE = (
+    "[handoff-notes] Your handoff is saved in {note}. The context was compacted, so read that "
+    "note and continue the task from its next step in this session, without waiting for user input."
+)
 _HANDOFF_HEADING = re.compile(r"(?m)^# Handoff\b")
+# Appended to a note whose handoff was continued in place: it closes the note's window.
+_CONTINUED_MARK = "<!-- handoff-notes: continued in this session -->"
 
 _WRITE_HANDOFF = (
     "[handoff-notes] This conversation now contains two or more context-compaction "
-    "summaries, so it is time to hand off to a fresh session. Finish the current atomic step "
+    "summaries, so it is time to write a handoff. Finish the current atomic step "
     "(never stop mid-edit or mid-run; at most {grace} more tool calls), then call write_file "
     "with path {note} and content = ONLY your handoff, starting with the '# Handoff' heading. "
     "The plugin appends it to the end of that note and keeps the summary already in it, so "
@@ -120,13 +127,27 @@ def _auto_key(session_id: str | None) -> str | None:
     return key
 
 
-def _cli():
-    # The classic CLI REPL hosting this agent, else None (gateway, TUI/desktop, cron).
-    return getattr(getattr(_ctx, "_manager", None), "_cli_ref", None)
+def _is_local(key: str) -> bool:
+    # A Local route: the classic CLI, TUI or desktop app viewing a gateway session.
+    return str(getattr(getattr(_sources.get(key), "platform", None), "value", "")) == "local"
+
+
+def _in_place(key: str) -> bool:
+    # Continue in the same session: Local viewers never follow a gateway reset, and under a session
+    # authority a plugin may continue a chat but not open the fresh session a reset makes.
+    if _is_local(key):
+        return True
+    try:
+        from gateway.session_authorities import active_authority
+        return active_authority(_gateway()) is not None
+    except Exception:
+        return False
 
 
 def _user_message(session_id: str | None, note: Path) -> str:
-    return (AUTO_MESSAGE if _cli() is not None or _auto_key(session_id) else USER_MESSAGE).format(note=note)
+    key = _auto_key(session_id)
+    message = USER_MESSAGE if key is None else IN_PLACE_MESSAGE if _in_place(key) else AUTO_MESSAGE
+    return message.format(note=note)
 _DONE = (
     "[handoff-notes] The handoff is written to {note} and this session is finished. Do not "
     "call any tools. Reply to the user exactly: \"{user_message}\" and stop."
@@ -156,6 +177,13 @@ def _handoff_written(note: Path) -> bool:
         return False
 
 
+def _continued(note: Path) -> bool:
+    try:
+        return _CONTINUED_MARK in note.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
 def _instruction(session_id: str | None) -> str | None:
     note = _handoff_note(session_id)
     if note is None:
@@ -177,7 +205,11 @@ def _handoff_note(session_id: str | None) -> Path | None:
         return None
     session = _safe(session_id)
     if session not in _finished:
-        notes = sorted(HANDOFF_DIR.glob(f"*/*-{session}-c*.md"))
+        # Sort by compression number (c10 after c9); only notes after the last in-place continue count.
+        notes = sorted(HANDOFF_DIR.glob(f"*/*-{session}-c*.md"),
+                       key=lambda n: int(re.search(r"-c(\d+)\.md$", n.name).group(1)))
+        last = max((i for i, n in enumerate(notes) if _continued(n)), default=-1)
+        notes = notes[last + 1:]
         if len(notes) < HANDOFF_AFTER:
             return None
         # A note that already holds the handoff wins over any later compression's note.
@@ -240,9 +272,10 @@ def on_post_auxiliary_call(**kw) -> None:
             ])
             path.write_text(header + summary + "\n", encoding="utf-8")
             _pending[session] = path
-            # A compression after the handoff was written must not replace the note that holds it.
-            if n >= HANDOFF_AFTER and not (prev and _handoff_written(prev)):
-                _finished[session] = path
+            # A compression after the handoff was written must not replace the note that holds it;
+            # otherwise the next lookup recounts from disk (notes since the last in-place continue).
+            if not (prev and _handoff_written(prev)):
+                _finished.pop(session, None)
         logger.info("handoff-notes: saved %s", path)
     except Exception:
         logger.warning("handoff-notes: could not save handoff note", exc_info=True)
@@ -270,11 +303,9 @@ def on_post_compaction(**kw) -> None:
             if kw.get("session_id") and kw.get("old_session_id"):
                 # Carrying the stop to a rotated session: only if the old one had
                 # already reached HANDOFF_AFTER compressions.
-                old = _safe(kw["old_session_id"])
-                if len(list(HANDOFF_DIR.glob(f"*/*-{old}-c*.md"))) >= HANDOFF_AFTER:
-                    old_note = _finished.get(old)
-                    _finished[_safe(kw["session_id"])] = (
-                        old_note if old_note and _handoff_written(old_note) else path)
+                old_note = _handoff_note(kw["old_session_id"])
+                if old_note is not None:
+                    _finished[_safe(kw["session_id"])] = old_note if _handoff_written(old_note) else path
             head, sep, body = path.read_text(encoding="utf-8").partition("\n---\n")
             for name, value in values.items():
                 head = re.sub(rf"(?m)^{name}: *$", f"{name}: {'' if value is None else value}", head)
@@ -378,41 +409,79 @@ def on_post_llm_call(session_id=None, **kw) -> None:
         note = _handoff_note(session_id)
         if note is None or session_id in _rotated or not _handoff_written(note):
             return
-        cli = _cli()
-        if cli is not None:
-            _rotated.add(session_id)
-            # Not inject_message: mid-turn it targets the interrupt queue, i.e. this ending turn.
-            # The REPL drains _pending_input after the turn: /new first, then the continue text.
-            cli._pending_input.put("/new")
-            cli._pending_input.put(_CONTINUE.format(note=note))
-            logger.info("handoff-notes: CLI session %s handing off via %s", session_id, note)
-            return
         key = _auto_key(session_id)
         if key is None:  # fallback: the user was told to /new
             logger.info("handoff-notes: no auto-handoff for %s (gateway=%s, off/unrouted)",
                         session_id, _gateway() is not None)
             return
         _rotated.add(session_id)
-        asyncio.run_coroutine_threadsafe(_rotate(key, session_id, note), _gateway()._gateway_loop)
+        step = _continue_in_place if _in_place(key) else _rotate
+        asyncio.run_coroutine_threadsafe(step(key, session_id, note), _gateway()._gateway_loop)
     except Exception:
         logger.warning("handoff-notes: could not schedule auto-handoff", exc_info=True)
+
+
+async def _idle_and_current(runner, key: str, session_id: str) -> bool:
+    # Never act mid-turn: wait (up to 10 min) for the turn and its reply to finish; then only if the
+    # chat is still on this session (turned off, or a manual /new by the user, wins).
+    for _ in range(600):
+        if key not in runner._running_agents:
+            break
+        await asyncio.sleep(1)
+    else:
+        logger.warning("handoff-notes: %s still busy, auto-handoff skipped", key)
+        return False
+    entry = runner.session_store._entries.get(key)
+    return key not in _off and entry is not None and entry.session_id == session_id
+
+
+def _close_window(session_id: str, note: Path | None = None) -> None:
+    # Mark `note` (default: the session's newest note) continued: notes up to it no longer count.
+    if note is None:
+        notes = sorted(HANDOFF_DIR.glob(f"*/*-{_safe(session_id)}-c*.md"),
+                       key=lambda n: int(re.search(r"-c(\d+)\.md$", n.name).group(1)))
+        note = notes[-1] if notes else None
+    with _lock:
+        if note is not None and not _continued(note):
+            with note.open("a", encoding="utf-8") as f:
+                f.write("\n" + _CONTINUED_MARK + "\n")
+        _finished.pop(_safe(session_id), None)
+        _grace_used.pop(_safe(session_id), None)
+
+
+async def _continue_in_place(key: str, session_id: str, note: Path) -> None:
+    try:
+        runner = _gateway()
+        if not await _idle_and_current(runner, key, session_id):
+            return
+        _close_window(session_id, note)  # the count restarts and tools are no longer blocked
+        # The closest thing to /clear that keeps the session (/clear and /new open a new one): summarize
+        # everything but the last turn. Still the same session, so the continue below stays allowed.
+        try:
+            from gateway.platforms.event import MessageEvent, MessageType
+            result = await runner._handle_compress_command(MessageEvent(
+                text="/compress here 1", message_type=MessageType.TEXT, source=_sources[key], internal=True))
+            logger.info("handoff-notes: compacted %s before continuing: %s", key, str(result)[:200])
+        except Exception:
+            logger.warning("handoff-notes: compaction before continuing failed for %s", key, exc_info=True)
+        _close_window(session_id)  # that compaction's own note must not count toward the next handoff
+        if _ctx.inject_message(_CONTINUE_IN_PLACE.format(note=note), session_key=key):
+            logger.info("handoff-notes: %s continues in session %s via %s", key, session_id, note)
+        else:
+            logger.warning("handoff-notes: continue message for %s was refused; the user can say "
+                           "'continue from %s'", key, note)
+    except Exception:
+        logger.warning("handoff-notes: in-place continue failed for %s", key, exc_info=True)
+    finally:
+        _rotated.discard(session_id)  # a later handoff of this session may continue again
 
 
 async def _rotate(key: str, old_session_id: str, note: Path) -> None:
     try:
         from gateway.platforms.event import MessageEvent, MessageType
         runner = _gateway()
-        # Never reset mid-turn: wait (up to 10 min) for the turn and its reply to finish.
-        for _ in range(600):
-            if key not in runner._running_agents:
-                break
-            await asyncio.sleep(1)
-        else:
-            logger.warning("handoff-notes: %s still busy, auto-handoff skipped", key)
+        if not await _idle_and_current(runner, key, old_session_id):
             return
-        entry = runner.session_store._entries.get(key)
-        if key in _off or entry is None or entry.session_id != old_session_id:
-            return  # turned off, or the user already started a new session (manual /new wins)
         await runner._handle_reset_command(MessageEvent(
             text="/new", message_type=MessageType.TEXT, source=_sources[key], internal=True))
         from gateway.session_authorities import active_authority
@@ -426,15 +495,9 @@ async def _rotate(key: str, old_session_id: str, note: Path) -> None:
         if new is not None:
             _resume[new.session_id] = note
         source = _sources[key]
-        # A Local route injects through its live source, which that rule does not apply to; the
-        # fallback stays armed in case the injection is refused later (a duplicate is harmless).
-        local = str(getattr(getattr(source, "platform", None), "value", "")) == "local"
-        message = RESUME_MESSAGE
-        if local and _ctx.inject_message(_CONTINUE.format(note=note), session_key=key):
-            message = LOCAL_MESSAGE
-        await runner._delivery_adapter_for(source).send(source.chat_id, message.format(note=note.name))
-        logger.info("handoff-notes: %s reset from %s (%s); resume via %s",
-                    key, old_session_id, "injected" if message is LOCAL_MESSAGE else "awaiting a message", note)
+        await runner._delivery_adapter_for(source).send(source.chat_id, RESUME_MESSAGE.format(note=note.name))
+        logger.info("handoff-notes: %s reset from %s; waiting for a message to resume via %s",
+                    key, old_session_id, note)
     except Exception:
         logger.warning("handoff-notes: auto-handoff failed for %s", key, exc_info=True)
 
