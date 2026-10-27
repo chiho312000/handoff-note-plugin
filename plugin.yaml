@@ -1,10 +1,11 @@
 name: handoff-notes
-version: 0.7.4
+version: 0.8.2
 description: >
   Archives the handoff summary Hermes writes each time it compresses a
   conversation, as a Markdown note under this profile's handoffs/<date>/ folder.
-  From the 2nd compaction the agent appends a handoff; in the gateway and the classic
-  CLI the chat then moves to a new session that continues from that note.
+  From the 2nd compaction the agent appends a handoff and the chat continues from it
+  in the same session (a gateway without a session authority moves messaging chats
+  to a new session instead).
 author: local
 kind: standalone
 provides_hooks:
