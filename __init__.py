@@ -17,15 +17,16 @@ allows GRACE_TOOL_CALLS more calls for the atomic step plus any call touching th
 handoffs folder, then blocks the rest. Once the note has a "# Handoff" heading, every
 tool is blocked. Failures are logged, never raised (and never block).
 
-Auto-handoff (gateway only): pre_gateway_dispatch remembers the runner and each chat's
-source. When the turn that wrote the handoff ends (post_llm_call), the chat is reset
+Auto-handoff (gateway): the runner is the one pre_gateway_dispatch saw, else the host the gateway
+publishes to plugin managers (Local desktop/TUI turns never fire pre_gateway_dispatch); a chat's
+source is the latest inbound one, else its session entry's restored origin. When the turn that
+wrote the handoff ends (post_llm_call), the chat is reset
 through the gateway's own /new path once it is idle, and the new session is told to read
 that note and continue. Under Hermes' session authority a plugin may only continue a chat,
 not open one, so there the user is asked to send any message and that first turn of the new
 session gets the continue instruction (pre_llm_call). A Local route (desktop/TUI chat) is
-exempt from that rule, so it is injected and also keeps that fallback. Until the
-first inbound message after a gateway start (runner not armed), or with /autohandoff off for
-that chat, the user is told to /new instead.
+exempt from that rule, so it is injected and also keeps that fallback. With no gateway in the
+process, or with /autohandoff off for that chat, the user is told to /new instead.
 
 Auto-handoff (classic CLI REPL): the same turn-end queues "/new" and then the continue
 instruction on the REPL's input queue, so the REPL starts a new session and continues in it.
@@ -90,13 +91,33 @@ _off: set[str] = set()  # session keys with /autohandoff off
 _resume: dict[str, Path] = {}  # new session id (minted by our own /new) -> note its first turn continues from
 
 
+def _gateway():
+    # The gateway runner: armed by pre_gateway_dispatch, else the host the gateway publishes to every
+    # plugin manager (Local desktop/TUI turns never fire pre_gateway_dispatch).
+    if _runner is not None:
+        return _runner
+    host = getattr(getattr(_ctx, "_manager", None), "_gateway_message_injector", None)
+    return host[0] if host else None
+
+
 def _auto_key(session_id: str | None) -> str | None:
     # The chat's session key when this session can hand off automatically.
-    if _runner is None or not session_id:
+    runner = _gateway()
+    if runner is None or not session_id:
         return None
-    entries = getattr(getattr(_runner, "session_store", None), "_entries", {}) or {}
+    entries = getattr(getattr(runner, "session_store", None), "_entries", {}) or {}
     key = next((k for k, e in list(entries.items()) if getattr(e, "session_id", None) == session_id), None)
-    return key if key in _sources and key not in _off else None
+    if key is None or key in _off:
+        return None
+    if key not in _sources:  # never dispatched through pre_gateway_dispatch: rebuild its origin
+        try:
+            source = runner._restored_source(entries[key])
+        except Exception:
+            source = None
+        if source is None:
+            return None
+        _sources[key] = source
+    return key
 
 
 def _cli():
@@ -361,10 +382,12 @@ def on_post_llm_call(session_id=None, **kw) -> None:
             logger.info("handoff-notes: CLI session %s handing off via %s", session_id, note)
             return
         key = _auto_key(session_id)
-        if key is None:
-            return  # fallback: the user was told to /new
+        if key is None:  # fallback: the user was told to /new
+            logger.info("handoff-notes: no auto-handoff for %s (gateway=%s, off/unrouted)",
+                        session_id, _gateway() is not None)
+            return
         _rotated.add(session_id)
-        asyncio.run_coroutine_threadsafe(_rotate(key, session_id, note), _runner._gateway_loop)
+        asyncio.run_coroutine_threadsafe(_rotate(key, session_id, note), _gateway()._gateway_loop)
     except Exception:
         logger.warning("handoff-notes: could not schedule auto-handoff", exc_info=True)
 
@@ -372,27 +395,28 @@ def on_post_llm_call(session_id=None, **kw) -> None:
 async def _rotate(key: str, old_session_id: str, note: Path) -> None:
     try:
         from gateway.platforms.event import MessageEvent, MessageType
+        runner = _gateway()
         # Never reset mid-turn: wait (up to 10 min) for the turn and its reply to finish.
         for _ in range(600):
-            if key not in _runner._running_agents:
+            if key not in runner._running_agents:
                 break
             await asyncio.sleep(1)
         else:
             logger.warning("handoff-notes: %s still busy, auto-handoff skipped", key)
             return
-        entry = _runner.session_store._entries.get(key)
+        entry = runner.session_store._entries.get(key)
         if key in _off or entry is None or entry.session_id != old_session_id:
             return  # turned off, or the user already started a new session (manual /new wins)
-        await _runner._handle_reset_command(MessageEvent(
+        await runner._handle_reset_command(MessageEvent(
             text="/new", message_type=MessageType.TEXT, source=_sources[key], internal=True))
         from gateway.session_authorities import active_authority
         # Under a session authority inject_message still returns True, but dispatch then refuses it
         # (the fresh session has no human message yet), so skip straight to the fallback there.
-        if active_authority(_runner) is None and _ctx.inject_message(_CONTINUE.format(note=note), session_key=key):
+        if active_authority(runner) is None and _ctx.inject_message(_CONTINUE.format(note=note), session_key=key):
             logger.info("handoff-notes: %s handed off from %s via %s", key, old_session_id, note)
             return
         # The fresh session's first human message resumes it instead.
-        new = _runner.session_store._entries.get(key)
+        new = runner.session_store._entries.get(key)
         if new is not None:
             _resume[new.session_id] = note
         source = _sources[key]
@@ -402,7 +426,7 @@ async def _rotate(key: str, old_session_id: str, note: Path) -> None:
         message = RESUME_MESSAGE
         if local and _ctx.inject_message(_CONTINUE.format(note=note), session_key=key):
             message = LOCAL_MESSAGE
-        await _runner._delivery_adapter_for(source).send(source.chat_id, message.format(note=note.name))
+        await runner._delivery_adapter_for(source).send(source.chat_id, message.format(note=note.name))
         logger.info("handoff-notes: %s reset from %s (%s); resume via %s",
                     key, old_session_id, "injected" if message is LOCAL_MESSAGE else "awaiting a message", note)
     except Exception:
@@ -416,7 +440,7 @@ def _autohandoff_command(raw_args: str = "", session_key: str | None = None) -> 
     elif session_key and arg == "on":
         _off.discard(session_key)
     state = "off" if session_key in _off else "on"
-    armed = "" if _runner is not None else " (arms on the next message after a gateway start)"
+    armed = "" if _gateway() is not None else " (no gateway in this process)"
     return f"Auto-handoff is {state} for this chat{armed}."
 
 
