@@ -1,5 +1,6 @@
 name: handoff-notes
 version: 0.8.3
+requires_hermes: ">=0.22.3"  # post_compaction hook and session-keyed inject_message
 description: >
   Archives the handoff summary Hermes writes each time it compresses a
   conversation, as a Markdown note under this profile's handoffs/<date>/ folder.

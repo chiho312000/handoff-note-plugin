@@ -5,6 +5,46 @@ Hermes plugin (v0.8.3, standalone) that keeps a long-running chat going across c
 - **Every compression:** the summary Hermes writes is saved as a Markdown note.
 - **From the Nth compression on** (N = `handoff_after`, default 2): the agent writes a handoff and the chat carries forward from it, so summaries don't keep piling on top of each other.
 
+## Installation
+
+**Requires Hermes 0.22.3 or later.** That release added the `post_compaction` hook and session-keyed `inject_message`, which the plugin uses. Check yours with `hermes --version`.
+
+Plugins are installed per profile. In the steps below, `<profile>` is the profile folder (for example `%LOCALAPPDATA%\hermes\profiles\gamebot`) and `<name>` is its profile name (for example `gamebot`).
+
+1. **Copy the plugin folder into the profile.** Leave out `__pycache__`.
+   If an older copy is already there, back it up first, following the existing `backups\handoff-notes.bak-<date>-<version>` naming:
+
+   ```powershell
+   $src = "<path to this handoff-notes folder>"
+   $dst = "<profile>\plugins\handoff-notes"
+   if (Test-Path $dst) { Copy-Item $dst "<profile>\backups\handoff-notes.bak-$(Get-Date -f yyyyMMdd)-<old version>" -Recurse }
+   robocopy $src $dst /E /XD __pycache__
+   ```
+
+2. **Enable the plugin**, either with the CLI:
+
+   ```powershell
+   hermes -p <name> plugins enable handoff-notes
+   ```
+
+   or by adding `handoff-notes` to `plugins.enabled` in `<profile>\config.yaml` yourself.
+
+3. **Add the plugin's entry** under `plugins.entries` in `<profile>\config.yaml`. The [Configuration](#configuration) section below shows the block.
+   Without `allow_gateway_injection: true`, the plugin still writes notes and handoffs, but the user has to `/new` by hand.
+
+4. **Restart the gateway** so the plugin loads:
+
+   ```powershell
+   hermes -p <name> gateway restart
+   ```
+
+5. **Check that it loaded.** The profile's gateway log should contain `handoff-notes: handoff after N compressions`.
+   If it shows `ignoring settings.handoff_after=...` instead, the value is invalid and the plugin is using 2.
+   Optionally run the self-tests; see [Testing](#testing).
+
+To uninstall, run `hermes -p <name> plugins disable handoff-notes`, then restart the gateway.
+The notes in `<profile>\handoffs\` are kept.
+
 ## What it does
 
 1. **Save a note per compression.** The summarizer reply is saved to
