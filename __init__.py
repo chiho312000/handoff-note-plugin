@@ -23,8 +23,9 @@ publishes to plugin managers (Local desktop/TUI turns never fire pre_gateway_dis
 source is the latest inbound one, else its session entry's restored origin. When the turn that
 wrote the handoff ends (post_llm_call), once the chat is idle, the chat continues in the same
 session: the note is marked continued, which restarts the compression count and lifts the tool
-block; the gateway's own "/compress here 1" then summarizes all but the last turn (the nearest
-thing to /clear that keeps the session), and the continue instruction is injected. That covers Local routes (the classic
+block; the live history is soft-archived and the continue instruction is injected with the handoff
+section inline, so the next summary starts fresh instead of growing on every earlier one (falls back
+to the gateway's "/compress here 1" if the reset fails). That covers Local routes (the classic
 CLI, TUI and desktop app are gateway viewers of one session and never follow a gateway-side
 reset) and every chat under a session authority (a plugin may continue a chat but not open the
 fresh session a reset makes). Only a gateway without a session authority resets messaging chats
@@ -43,6 +44,11 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+
+def _dbg(msg: str, *args) -> None:
+    # Trace of every hook decision; INFO so it lands in gateway.log/agent.log at the default level.
+    logger.info("handoff-notes[dbg] " + msg, *args)
+
 # plugins/handoff-notes/__init__.py -> the profile folder that owns this plugin
 PROFILE_DIR = Path(__file__).resolve().parents[2]
 HANDOFF_DIR = PROFILE_DIR / "handoffs"
@@ -57,7 +63,7 @@ _finished: dict[str, Path] = {}
 _grace_used: dict[str, int] = {}
 
 GRACE_TOOL_CALLS = 6
-HANDOFF_AFTER = 2  # ponytail: compaction 1 saves a note only; handoff stops from compaction 2 on
+HANDOFF_AFTER = 2  # default; config plugins.entries.handoff-notes.settings.handoff_after overrides it in register()
 USER_MESSAGE = "Context compacted — handoff written. Start /new and say: continue from {note}"
 AUTO_MESSAGE = "Context compacted — handoff written to {note}. Moving to a new session."
 IN_PLACE_MESSAGE = ("Context compacted — handoff written to {note}. Clearing the context and continuing "
@@ -74,12 +80,17 @@ _CONTINUE_IN_PLACE = (
     "[handoff-notes] Your handoff is saved in {note}. The context was compacted, so read that "
     "note and continue the task from its next step in this session, without waiting for user input."
 )
+_CONTINUE_FROM_HANDOFF = (
+    "[handoff-notes] The context was reset to your handoff below (the full note, with the older "
+    "summary, is {note}; read it only if the handoff lacks something). Continue the task from its "
+    "next step in this session, without waiting for user input.\n\n{handoff}"
+)
 _HANDOFF_HEADING = re.compile(r"(?m)^# Handoff\b")
 # Appended to a note whose handoff was continued in place: it closes the note's window.
 _CONTINUED_MARK = "<!-- handoff-notes: continued in this session -->"
 
 _WRITE_HANDOFF = (
-    "[handoff-notes] This conversation now contains two or more context-compaction "
+    "[handoff-notes] This conversation now contains {count} or more context-compaction "
     "summaries, so it is time to write a handoff. Finish the current atomic step "
     "(never stop mid-edit or mid-run; at most {grace} more tool calls), then call write_file "
     "with path {note} and content = ONLY your handoff, starting with the '# Handoff' heading. "
@@ -192,7 +203,7 @@ def _instruction(session_id: str | None) -> str | None:
     if _handoff_written(note):
         return _DONE.format(note=note, user_message=user_message)
     left = max(0, GRACE_TOOL_CALLS - _grace_used.get(_safe(session_id), 0))
-    return _WRITE_HANDOFF.format(grace=left, note=note, template=_template(), user_message=user_message)
+    return _WRITE_HANDOFF.format(count=HANDOFF_AFTER, grace=left, note=note, template=_template(), user_message=user_message)
 
 
 def _safe(session_id: str) -> str:
@@ -233,17 +244,24 @@ def _next_index(session: str) -> int:
 
 def on_post_auxiliary_call(**kw) -> None:
     try:
-        if kw.get("aux_task") != "compression" or kw.get("error"):
+        if kw.get("aux_task") != "compression":
+            return
+        _dbg("compression: aux call done session=%s error=%r finish=%s", kw.get("session_id"),
+             kw.get("error"), kw.get("finish_reason"))
+        if kw.get("error"):
             return
         if not _active_profile_is_ours():
+            _dbg("compression: skipped, active profile is not ours (%s)", PROFILE_DIR)
             return
         message = ((kw.get("response") or {}).get("assistant_message") or {})
         content = message.get("content")
         if not isinstance(content, str):
+            _dbg("compression: skipped, summary content is %s", type(content).__name__)
             return
         # The summarizer may quote an earlier handoff; demote it so it never counts as this note's handoff.
         summary = _HANDOFF_HEADING.sub("## Handoff", _THINK_RE.sub("", content).strip())
         if not summary:
+            _dbg("compression: skipped, summary empty after stripping <think>")
             return
 
         session = _safe(kw.get("session_id") or "no-session")
@@ -277,12 +295,16 @@ def on_post_auxiliary_call(**kw) -> None:
             if not (prev and _handoff_written(prev)):
                 _finished.pop(session, None)
         logger.info("handoff-notes: saved %s", path)
+        _dbg("compression: note #%d, handoff note now=%s", n, _handoff_note(kw.get("session_id")))
     except Exception:
         logger.warning("handoff-notes: could not save handoff note", exc_info=True)
 
 
 def on_post_compaction(**kw) -> None:
     try:
+        _dbg("post_compaction: kind=%s session=%s old_session=%s removed=%s tokens %s->%s reason=%s",
+             kw.get("kind"), kw.get("session_id"), kw.get("old_session_id"), kw.get("messages_removed"),
+             kw.get("before_tokens"), kw.get("after_tokens"), kw.get("reason"))
         if kw.get("kind") != "summarize":
             return
         # A rotating commit reports the new session id and the one the summary ran under.
@@ -299,6 +321,7 @@ def on_post_compaction(**kw) -> None:
                 if sid:
                     path = _pending.pop(_safe(sid), None) or path
             if path is None or not path.exists():
+                _dbg("post_compaction: no pending note for %s", ids)
                 return
             if kw.get("session_id") and kw.get("old_session_id"):
                 # Carrying the stop to a rotated session: only if the old one had
@@ -326,11 +349,14 @@ def on_pre_tool_call(**kw):
         elif kw.get("tool_name") == "write_file" and isinstance(args, dict) and _is_note(args.get("path"), note):
             return _append_handoff(session_id, note, args.get("content"))
         elif "handoffs" in str(args or ""):
+            _dbg("permission: allowed %s in %s (touches handoffs)", kw.get("tool_name"), session_id)
             return None  # reading/writing the handoff note itself is always allowed
         else:
             used = _grace_used.get(_safe(session_id), 0)
             if used < GRACE_TOOL_CALLS:
                 _grace_used[_safe(session_id)] = used + 1
+                _dbg("permission: allowed %s in %s (grace %d/%d)", kw.get("tool_name"), session_id,
+                     used + 1, GRACE_TOOL_CALLS)
                 return None
             reason = "grace calls used up"
         logger.info("handoff-notes: blocked %s in session %s (%s)", kw.get("tool_name"), session_id, reason)
@@ -383,9 +409,11 @@ def on_pre_llm_call(**kw):
     try:
         note = _resume.pop(kw.get("session_id"), None)
         if note is not None:
+            _dbg("pre_llm_call: %s resumes from %s", kw.get("session_id"), note)
             return {"context": _CONTINUE.format(note=note)}
         text = _instruction(kw.get("session_id"))
         if text is not None:
+            _dbg("pre_llm_call: %s gets instruction: %s", kw.get("session_id"), text[:80])
             return {"context": text}
     except Exception:
         logger.warning("handoff-notes: pre_llm_call check failed", exc_info=True)
@@ -396,8 +424,12 @@ def on_pre_gateway_dispatch(event=None, gateway=None, **kw):
     global _runner
     try:
         if gateway is not None and event is not None and _active_profile_is_ours():
+            first = _runner is None
             _runner = gateway
-            _sources[gateway._session_key_for_source(event.source)] = event.source
+            key = gateway._session_key_for_source(event.source)
+            _sources[key] = event.source
+            if first:
+                _dbg("dispatch: gateway armed by %s", key)
     except Exception:
         logger.warning("handoff-notes: could not arm auto-handoff", exc_info=True)
     return None
@@ -407,7 +439,10 @@ def on_post_llm_call(session_id=None, **kw) -> None:
     # Fires once per turn after the tool loop: the turn that wrote the handoff is ending.
     try:
         note = _handoff_note(session_id)
-        if note is None or session_id in _rotated or not _handoff_written(note):
+        written = note is not None and _handoff_written(note)
+        _dbg("turn end: session=%s note=%s handoff_written=%s already_rotating=%s",
+             session_id, note, written, session_id in _rotated)
+        if note is None or session_id in _rotated or not written:
             return
         key = _auto_key(session_id)
         if key is None:  # fallback: the user was told to /new
@@ -416,6 +451,7 @@ def on_post_llm_call(session_id=None, **kw) -> None:
             return
         _rotated.add(session_id)
         step = _continue_in_place if _in_place(key) else _rotate
+        _dbg("turn end: dispatching %s for %s (local=%s)", step.__name__, key, _is_local(key))
         asyncio.run_coroutine_threadsafe(step(key, session_id, note), _gateway()._gateway_loop)
     except Exception:
         logger.warning("handoff-notes: could not schedule auto-handoff", exc_info=True)
@@ -424,7 +460,7 @@ def on_post_llm_call(session_id=None, **kw) -> None:
 async def _idle_and_current(runner, key: str, session_id: str) -> bool:
     # Never act mid-turn: wait (up to 10 min) for the turn and its reply to finish; then only if the
     # chat is still on this session (turned off, or a manual /new by the user, wins).
-    for _ in range(600):
+    for waited in range(600):
         if key not in runner._running_agents:
             break
         await asyncio.sleep(1)
@@ -432,7 +468,10 @@ async def _idle_and_current(runner, key: str, session_id: str) -> bool:
         logger.warning("handoff-notes: %s still busy, auto-handoff skipped", key)
         return False
     entry = runner.session_store._entries.get(key)
-    return key not in _off and entry is not None and entry.session_id == session_id
+    ok = key not in _off and entry is not None and entry.session_id == session_id
+    _dbg("continue: idle after %ds, off=%s chat_session=%s expected=%s -> %s", waited, key in _off,
+         getattr(entry, "session_id", None), session_id, ok)
+    return ok
 
 
 def _close_window(session_id: str, note: Path | None = None) -> None:
@@ -449,23 +488,63 @@ def _close_window(session_id: str, note: Path | None = None) -> None:
         _grace_used.pop(_safe(session_id), None)
 
 
+def _handoff_section(note: Path) -> str:
+    # Only the bot's handoff: the compression summary above it is what snowballed when carried
+    # forward (2026-11-07 06:43: summary hit llama-server's -n 16384 cap, session auto-reset).
+    try:
+        text = note.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    m = _HANDOFF_HEADING.search(text)
+    return text[m.start():].replace(_CONTINUED_MARK, "").strip() if m else ""
+
+
+def _archive_live_history(store, session_id: str) -> bool:
+    # Soft-archive every live row (active=0, still searchable), the way /retry's rewind does, so the
+    # next turn starts from the handoff alone and no earlier summary is fed back to the summarizer.
+    db = store._db_for_session_id(session_id)
+    if db is None:
+        return False
+    with store._get_transcript_drain_lock():
+        db.replace_messages(session_id, [], archive_dropped=True, reject_active_turn_lease=True)
+        store._clear_dirty_transcript(session_id)
+    return True
+
+
 async def _continue_in_place(key: str, session_id: str, note: Path) -> None:
     try:
         runner = _gateway()
         if not await _idle_and_current(runner, key, session_id):
             return
         _close_window(session_id, note)  # the count restarts and tools are no longer blocked
-        # The closest thing to /clear that keeps the session (/clear and /new open a new one): summarize
-        # everything but the last turn. Still the same session, so the continue below stays allowed.
+        handoff = _handoff_section(note)
+        message = _CONTINUE_FROM_HANDOFF.format(note=note, handoff=handoff)
         try:
-            from gateway.platforms.event import MessageEvent, MessageType
-            result = await runner._handle_compress_command(MessageEvent(
-                text="/compress here 1", message_type=MessageType.TEXT, source=_sources[key], internal=True))
-            logger.info("handoff-notes: compacted %s before continuing: %s", key, str(result)[:200])
+            reset = bool(handoff) and await asyncio.to_thread(_archive_live_history, runner.session_store, session_id)
         except Exception:
-            logger.warning("handoff-notes: compaction before continuing failed for %s", key, exc_info=True)
-        _close_window(session_id)  # that compaction's own note must not count toward the next handoff
-        if _ctx.inject_message(_CONTINUE_IN_PLACE.format(note=note), session_key=key):
+            reset = False
+            logger.warning("handoff-notes: history reset failed for %s", key, exc_info=True)
+        if reset:
+            runner._evict_cached_agent(key)  # its compressor still holds the old summary in memory
+            entry = runner.session_store._entries.get(key)
+            if entry is not None:
+                entry.last_prompt_tokens = 0
+            logger.info("handoff-notes: %s history reset to the handoff (%d chars)", key, len(handoff))
+        else:
+            # Fallback: "/compress here 1" refuses when the head is only the old summary
+            # (insufficient_messages), so the summary keeps growing; better than nothing.
+            logger.warning("handoff-notes: %s history NOT reset (handoff %d chars); falling back to "
+                           "/compress here 1", key, len(handoff))
+            message = _CONTINUE_IN_PLACE.format(note=note)
+            try:
+                from gateway.platforms.event import MessageEvent, MessageType
+                result = await runner._handle_compress_command(MessageEvent(
+                    text="/compress here 1", message_type=MessageType.TEXT, source=_sources[key], internal=True))
+                logger.info("handoff-notes: compacted %s before continuing: %s", key, str(result)[:200])
+            except Exception:
+                logger.warning("handoff-notes: compaction before continuing failed for %s", key, exc_info=True)
+            _close_window(session_id)  # that compaction's own note must not count toward the next handoff
+        if _ctx.inject_message(message, session_key=key):
             logger.info("handoff-notes: %s continues in session %s via %s", key, session_id, note)
         else:
             logger.warning("handoff-notes: continue message for %s was refused; the user can say "
@@ -514,8 +593,15 @@ def _autohandoff_command(raw_args: str = "", session_key: str | None = None) -> 
 
 
 def register(ctx) -> None:
-    global _ctx
+    global _ctx, HANDOFF_AFTER
     _ctx = ctx
+    value = ctx.get_config("handoff_after", HANDOFF_AFTER)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+        HANDOFF_AFTER = value
+    else:
+        logger.warning("handoff-notes: ignoring settings.handoff_after=%r (need an integer >= 1), using %d",
+                       value, HANDOFF_AFTER)
+    logger.info("handoff-notes: handoff after %d compressions", HANDOFF_AFTER)
     ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)
     ctx.register_hook("post_llm_call", on_post_llm_call)
     ctx.register_command("autohandoff", _autohandoff_command,
